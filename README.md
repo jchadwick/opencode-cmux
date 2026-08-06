@@ -69,21 +69,28 @@ Without `--port`, splits are silently skipped even when enabled.
 
 | Event | cmux action |
 |---|---|
-| Plugin starts | Clear the generic `opencode` status, then initialize the persistent `opencode-subagents` pill to "Idle" (`pause.circle.fill`, `#8E8E93`) |
-| Any session is busy/retrying, or a task tool is running | `opencode-subagents`: "Running" (`bolt.fill`, `#4C8DFF`) |
-| Permission or question is pending | `opencode-subagents`: "Needs input" (`bell.fill`, `#4C8DFF`), taking precedence over activity |
-| Activity and input are clear | Return the same persistent pill to "Idle"; no status is cleared |
+| Plugin starts | Clear exactly the legacy `opencode` and `opencode-subagents` statuses, then initialize this server slot's scoped pill to "Idle" (`pause.circle.fill`, `#8E8E93`) |
+| Any session is busy/retrying, or a task tool is running | The scoped pill shows "Running" (`bolt.fill`, `#4C8DFF`) immediately; pending task tools do not count as running activity |
+| Permission or question is pending | The scoped pill shows "Needs input" (`bell.fill`, `#4C8DFF`) immediately, taking precedence over activity |
+| Activity and input are clear | After 250 ms of stable Idle, return the same scoped pill to "Idle"; no status is cleared |
 | Session completes (primary) | Desktop notification + log |
 | Session completes (subagent) | Log only (no notification spam) |
 | Session error | Desktop notification + log |
 | Permission requested | Desktop notification + log |
 | AI has a question (`ask` tool) | Desktop notification + log |
 
-The dedicated `opencode-subagents` status is the plugin's persistent status
-pill. It ignores pending task tools, gives pending input priority over work,
-and never writes the generic `opencode` status after startup. The
-`permission.ask` hook still announces and logs a request; the authoritative
-permission event is what changes the pill to "Needs input".
+The status key is scoped to the originating OpenCode surface: the trimmed
+`CMUX_SURFACE_ID` produces `opencode-subagents:<surfaceID>`, while a missing or
+blank value falls back to `opencode-subagents:pid:<pid>`. Each key represents
+one full OpenCode server slot, so parent sessions, child sessions, and task
+tools in that server are aggregated into the same pill. At startup, only the
+exact legacy keys `opencode` and `opencode-subagents` are cleared; existing
+scoped keys are never cleared. The scoped pill ignores pending task tools,
+counts running task tools as activity, gives pending input priority over work,
+and never writes the generic `opencode` status after migration. Idle is
+debounced for 250 ms to avoid transient flashes. The `permission.ask` hook
+still announces and logs a request; the authoritative permission event is what
+changes the pill to "Needs input".
 
 ## How it works
 

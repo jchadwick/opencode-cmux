@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test"
+import { afterEach, beforeEach, expect, test } from "bun:test"
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -46,20 +46,57 @@ type ShellController = {
 type Harness = {
   commands: string[]
   shell: ShellController
+  statusKey: string
   emit(event: unknown): Promise<void>
   permissionAsk(input: unknown): Promise<void>
   setSession(session: SessionInfo): void
 }
 
+const DEFAULT_STATUS_KEY = "opencode-subagents:surface:root"
 const STARTUP_STATUS = [
   "clear-status opencode",
-  "set-status opencode-subagents Idle --icon pause.circle.fill --color #8E8E93",
+  "clear-status opencode-subagents",
+  `set-status ${DEFAULT_STATUS_KEY} Idle --icon pause.circle.fill --color #8E8E93`,
 ]
-const IDLE_STATUS = STARTUP_STATUS[1]
+const IDLE_STATUS = STARTUP_STATUS[2]
 const RUNNING_STATUS =
-  "set-status opencode-subagents Running --icon bolt.fill --color #4C8DFF"
+  `set-status ${DEFAULT_STATUS_KEY} Running --icon bolt.fill --color #4C8DFF`
 const NEEDS_INPUT_STATUS =
-  "set-status opencode-subagents Needs input --icon bell.fill --color #4C8DFF"
+  `set-status ${DEFAULT_STATUS_KEY} Needs input --icon bell.fill --color #4C8DFF`
+
+type ScheduledTimer = { at: number; callback: () => void }
+
+let realSetTimeout: typeof setTimeout
+let realClearTimeout: typeof clearTimeout
+let timerNow = 0
+let nextTimerID = 0
+let scheduledTimers = new Map<number, ScheduledTimer>()
+
+beforeEach(() => {
+  realSetTimeout = globalThis.setTimeout
+  realClearTimeout = globalThis.clearTimeout
+  timerNow = 0
+  nextTimerID = 0
+  scheduledTimers = new Map()
+
+  globalThis.setTimeout = ((callback: (...args: any[]) => void, delay?: number, ...args: any[]) => {
+    const id = ++nextTimerID
+    scheduledTimers.set(id, {
+      at: timerNow + Math.max(0, delay ?? 0),
+      callback: () => callback(...args),
+    })
+    return id as unknown as ReturnType<typeof setTimeout>
+  }) as typeof setTimeout
+  globalThis.clearTimeout = ((id: unknown) => {
+    scheduledTimers.delete(Number(id))
+  }) as typeof clearTimeout
+})
+
+afterEach(() => {
+  globalThis.setTimeout = realSetTimeout
+  globalThis.clearTimeout = realClearTimeout
+  scheduledTimers.clear()
+})
 
 function snapshotEnvironment(): NodeJS.ProcessEnv {
   return { ...process.env }
@@ -128,7 +165,7 @@ function makeShell(
   }
 
   function runCommand(command: string): Promise<FakeResult> {
-    const isDedicated = command.includes("opencode-subagents")
+    const isDedicated = statusCommand(command).startsWith("set-status opencode-subagents:")
     if (isDedicated) dedicatedCommandsStarted++
 
     const isStartupClear = statusCommand(command) === "clear-status opencode"
@@ -188,6 +225,7 @@ async function withHarness(
   options: {
     splits?: boolean
     lookup?: Lookup
+    surfaceID?: string | null
     deferDedicated?: boolean
     deferStartupClear?: boolean
     deferSplit?: boolean
@@ -201,7 +239,12 @@ async function withHarness(
   try {
     process.env.CMUX_WORKSPACE_ID = "workspace:test"
     process.env.XDG_CONFIG_HOME = configHome
-    process.env.CMUX_SURFACE_ID = "surface:root"
+    if ("surfaceID" in options) {
+      if (typeof options.surfaceID === "string") process.env.CMUX_SURFACE_ID = options.surfaceID
+      else delete process.env.CMUX_SURFACE_ID
+    } else {
+      process.env.CMUX_SURFACE_ID = "surface:root"
+    }
     if (options.splits) {
       process.env.OPENCODE_SERVER_URL = "http://localhost:4096"
       writeFileSync(join(configDirectory, "opencode-cmux.json"), '{"splits":true}')
@@ -242,6 +285,7 @@ async function withHarness(
     await run({
       commands,
       shell: controller,
+      statusKey: getStatusKey(process.env.CMUX_SURFACE_ID),
       emit: (event) => hooks.event!({ event } as never),
       permissionAsk: (input) => permissionHook(input),
       setSession: (session) => sessions.set(session.id, session),
@@ -253,7 +297,35 @@ async function withHarness(
 }
 
 async function settleRenders(): Promise<void> {
+  advanceTimersBy(250)
+  await settleMicrotasks()
+}
+
+async function settleMicrotasks(): Promise<void> {
   for (let turn = 0; turn < 8; turn++) await Promise.resolve()
+}
+
+function advanceTimersBy(milliseconds: number): void {
+  const target = timerNow + milliseconds
+  while (true) {
+    const next = [...scheduledTimers.entries()]
+      .filter(([, timer]) => timer.at <= target)
+      .sort(([, left], [, right]) => left.at - right.at)[0]
+    if (!next) break
+
+    const [id, timer] = next
+    scheduledTimers.delete(id)
+    timerNow = timer.at
+    timer.callback()
+  }
+  timerNow = target
+}
+
+function getStatusKey(surfaceID: string | undefined): string {
+  const trimmed = surfaceID?.trim()
+  return trimmed
+    ? `opencode-subagents:${trimmed}`
+    : `opencode-subagents:pid:${process.pid}`
 }
 
 function session(id: string, parentID?: string): SessionInfo {
@@ -453,11 +525,19 @@ function statusCommands(commands: string[]): string[] {
 }
 
 function dedicatedStatusCommands(commands: string[]): string[] {
-  return statusCommands(commands).filter(
-    (command) =>
-      command.startsWith("set-status opencode-subagents ") ||
-      command === "clear-status opencode-subagents",
+  return statusCommands(commands).filter((command) =>
+    command.startsWith("set-status opencode-subagents:"),
   )
+}
+
+function scopedStatusCommandsFor(commands: string[], key: string): string[] {
+  return statusCommands(commands).filter((command) =>
+    command.startsWith(`set-status ${key} `),
+  )
+}
+
+function statusFor(key: string, text: string, icon: string, color: string): string {
+  return `set-status ${key} ${text} --icon ${icon} --color ${color}`
 }
 
 function genericStatusCommands(commands: string[]): string[] {
@@ -487,9 +567,7 @@ function splitCloses(commands: string[]): string[] {
 function expectPersistentStatus(commands: string[], expected: string[]): void {
   expect(dedicatedStatusCommands(commands)).toEqual(expected)
   expect(genericStatusCommands(commands)).toEqual(["clear-status opencode"])
-  expect(dedicatedStatusCommands(commands)).not.toContain(
-    "clear-status opencode-subagents",
-  )
+  expect(statusCommands(commands)).toContain("clear-status opencode-subagents")
 }
 
 test("serializes startup and matches status keys exactly", async () => {
@@ -725,12 +803,7 @@ test("does not complete a stale idle while an unknown child becomes busy again",
       await Promise.all([firstBusy, staleIdle, secondBusy, created])
       await settleRenders()
 
-      expectPersistentStatus(harness.commands, [
-        IDLE_STATUS,
-        RUNNING_STATUS,
-        IDLE_STATUS,
-        RUNNING_STATUS,
-      ])
+      expectPersistentStatus(harness.commands, [IDLE_STATUS, RUNNING_STATUS])
       expect(subagentLogs(harness.commands)).toHaveLength(0)
       expect(notifications(harness.commands)).toHaveLength(0)
       expect(harness.commands.filter((command) => command.includes("new-split"))).toHaveLength(1)
@@ -878,6 +951,7 @@ test("permission.ask announces without changing status and later event deduplica
     await harness.emit(
       permissionReplied("root", "permission-v2", "permission.v2.replied"),
     )
+    await settleRenders()
     await harness.emit(
       permissionAsked("permission.updated", "root", "permission-legacy", "edit file"),
     )
@@ -983,37 +1057,42 @@ test("deduplicates session.idle completion and supports later cycles", async () 
 test("serializes rapid renders and recovers after a failed dedicated command", async () => {
   await withHarness(
     async (harness) => {
-      const transitions = [
-        harness.emit(taskUpdate("root", "message-1", "task-1", "running")),
-        harness.emit(taskUpdate("root", "message-1", "task-1", "completed")),
-        harness.emit(taskUpdate("root", "message-2", "task-2", "running")),
-      ]
-      await Promise.all(transitions)
-      await Promise.resolve()
-
+      await harness.emit(taskUpdate("root", "message-1", "task-1", "running"))
       expect(harness.shell.inFlight).toBe(1)
       expect(harness.shell.maxInFlight).toBe(1)
       expect(harness.shell.pending).toHaveLength(1)
       expectPersistentStatus(harness.commands, [IDLE_STATUS, RUNNING_STATUS])
 
       harness.shell.releaseNext()
-      await settleRenders()
-      expect(harness.shell.inFlight).toBe(1)
+      await settleMicrotasks()
+      expect(harness.shell.inFlight).toBe(0)
       expect(harness.shell.maxInFlight).toBe(1)
-      expect(harness.shell.pending.map((operation) => operation.command)).toEqual([
-        expect.stringContaining("set-status opencode-subagents Idle"),
-      ])
 
-      harness.shell.rejectNext()
+      await harness.emit(taskUpdate("root", "message-1", "task-1", "completed"))
       await settleRenders()
       expect(harness.shell.inFlight).toBe(1)
       expect(harness.shell.maxInFlight).toBe(1)
       expect(harness.shell.pending.map((operation) => operation.command)).toEqual([
-        expect.stringContaining("set-status opencode-subagents Running"),
+        expect.stringContaining("set-status opencode-subagents:"),
       ])
 
       harness.shell.releaseNext()
+      await settleMicrotasks()
+      await harness.emit(taskUpdate("root", "message-2", "task-2", "running"))
+      expect(harness.shell.inFlight).toBe(1)
+      expect(harness.shell.maxInFlight).toBe(1)
+      expect(harness.shell.pending.map((operation) => operation.command)).toEqual([
+        expect.stringContaining("set-status opencode-subagents:"),
+      ])
+
+      harness.shell.rejectNext()
+      await settleMicrotasks()
+      await harness.emit(taskUpdate("root", "message-2", "task-2", "completed"))
       await settleRenders()
+      expect(harness.shell.inFlight).toBe(1)
+      expect(harness.shell.maxInFlight).toBe(1)
+      harness.shell.releaseNext()
+      await settleMicrotasks()
       expect(harness.shell.inFlight).toBe(0)
       expect(harness.shell.pending).toHaveLength(0)
       expectPersistentStatus(harness.commands, [
@@ -1021,6 +1100,7 @@ test("serializes rapid renders and recovers after a failed dedicated command", a
         RUNNING_STATUS,
         IDLE_STATUS,
         RUNNING_STATUS,
+        IDLE_STATUS,
       ])
     },
     { deferDedicated: true },
@@ -1128,4 +1208,189 @@ test("closes a split when idle or error arrives during creation", async () => {
       { splits: true, deferSplit: true },
     )
   }
+})
+
+test("uses one trimmed scoped key for each originating surface", async () => {
+  const surfaceIDs = ["surface:one", " surface:two "]
+  const observed: string[] = []
+
+  for (const surfaceID of surfaceIDs) {
+    await withHarness(async (harness) => {
+      observed.push(harness.statusKey)
+      expect(scopedStatusCommandsFor(harness.commands, harness.statusKey)).toEqual([
+        statusFor(harness.statusKey, "Idle", "pause.circle.fill", "#8E8E93"),
+      ])
+    }, { surfaceID })
+  }
+
+  expect(observed).toEqual([
+    "opencode-subagents:surface:one",
+    "opencode-subagents:surface:two",
+  ])
+  expect(new Set(observed).size).toBe(2)
+})
+
+test("uses the PID fallback for blank and missing surface IDs", async () => {
+  for (const surfaceID of ["", "   ", null] as const) {
+    await withHarness(async (harness) => {
+      expect(harness.statusKey).toBe(`opencode-subagents:pid:${process.pid}`)
+      expect(scopedStatusCommandsFor(harness.commands, harness.statusKey)).toEqual([
+        statusFor(harness.statusKey, "Idle", "pause.circle.fill", "#8E8E93"),
+      ])
+    }, { surfaceID })
+  }
+})
+
+test("startup migration clears exactly both legacy keys and no scoped key", async () => {
+  await withHarness(async (harness) => {
+    expect(statusCommands(harness.commands)).toEqual(STARTUP_STATUS)
+    expect(statusCommands(harness.commands)).not.toContain(
+      `clear-status ${harness.statusKey}`,
+    )
+    expect(statusCommands(harness.commands)).not.toContain("clear-status opencode-subagents:")
+  })
+})
+
+test("activity arriving while legacy cleanup is blocked publishes Running without startup Idle", async () => {
+  await withHarness(
+    async (harness) => {
+      expect(statusCommands(harness.commands)).toEqual(["clear-status opencode"])
+
+      await harness.emit(taskUpdate("root", "startup-message", "startup-task", "running"))
+      await settleMicrotasks()
+      expect(statusCommands(harness.commands)).toEqual(["clear-status opencode"])
+
+      harness.shell.releaseNext()
+      await settleMicrotasks()
+      expect(statusCommands(harness.commands)).toEqual([
+        "clear-status opencode",
+        "clear-status opencode-subagents",
+        RUNNING_STATUS,
+      ])
+      expect(scopedStatusCommandsFor(harness.commands, harness.statusKey)).toEqual([
+        RUNNING_STATUS,
+      ])
+    },
+    { deferStartupClear: true },
+  )
+})
+
+test("renders Running and Needs input immediately", async () => {
+  await withHarness(async (harness) => {
+    await harness.emit(taskUpdate("root", "immediate-message", "immediate-task", "running"))
+    await settleMicrotasks()
+    expect(dedicatedStatusCommands(harness.commands)).toEqual([IDLE_STATUS, RUNNING_STATUS])
+
+    await harness.emit(permissionAsked("permission.asked", "root", "immediate-permission"))
+    await settleMicrotasks()
+    expect(dedicatedStatusCommands(harness.commands)).toEqual([
+      IDLE_STATUS,
+      RUNNING_STATUS,
+      NEEDS_INPUT_STATUS,
+    ])
+  })
+})
+
+test("does not render Idle at 249ms, then renders it once at 250ms", async () => {
+  await withHarness(async (harness) => {
+    await harness.emit(taskUpdate("root", "stable-message", "stable-task", "running"))
+    await settleMicrotasks()
+    await harness.emit(taskUpdate("root", "stable-message", "stable-task", "completed"))
+
+    advanceTimersBy(249)
+    await settleMicrotasks()
+    expect(dedicatedStatusCommands(harness.commands)).toEqual([IDLE_STATUS, RUNNING_STATUS])
+
+    advanceTimersBy(1)
+    await settleMicrotasks()
+    expect(dedicatedStatusCommands(harness.commands)).toEqual([
+      IDLE_STATUS,
+      RUNNING_STATUS,
+      IDLE_STATUS,
+    ])
+
+    advanceTimersBy(250)
+    await settleMicrotasks()
+    expect(dedicatedStatusCommands(harness.commands)).toEqual([
+      IDLE_STATUS,
+      RUNNING_STATUS,
+      IDLE_STATUS,
+    ])
+  })
+})
+
+test("suppresses an Idle render for Running to Idle to Running", async () => {
+  await withHarness(async (harness) => {
+    await harness.emit(taskUpdate("root", "bounce-message", "bounce-task", "running"))
+    await settleMicrotasks()
+    await harness.emit(taskUpdate("root", "bounce-message", "bounce-task", "completed"))
+    await harness.emit(taskUpdate("root", "bounce-message-2", "bounce-task-2", "running"))
+
+    advanceTimersBy(250)
+    await settleMicrotasks()
+    expect(dedicatedStatusCommands(harness.commands)).toEqual([IDLE_STATUS, RUNNING_STATUS])
+  })
+})
+
+test("reconciles a timer-fired Idle render when activity arrives while it is blocked", async () => {
+  await withHarness(
+    async (harness) => {
+      await harness.emit(taskUpdate("root", "blocked-message", "blocked-task", "running"))
+      expect(harness.shell.pending.map((operation) => operation.command)).toEqual([
+        expect.stringContaining("set-status opencode-subagents:"),
+      ])
+      harness.shell.releaseNext()
+      await settleMicrotasks()
+
+      await harness.emit(taskUpdate("root", "blocked-message", "blocked-task", "completed"))
+      advanceTimersBy(250)
+      await settleMicrotasks()
+      expect(harness.shell.pending.map((operation) => operation.command)).toEqual([
+        expect.stringContaining(" Idle"),
+      ])
+
+      await harness.emit(taskUpdate("root", "blocked-message-2", "blocked-task-2", "running"))
+      expect(dedicatedStatusCommands(harness.commands)).toEqual([
+        IDLE_STATUS,
+        RUNNING_STATUS,
+        statusFor(harness.statusKey, "Idle", "pause.circle.fill", "#8E8E93"),
+      ])
+
+      harness.shell.releaseNext()
+      await settleMicrotasks()
+      expect(harness.shell.pending.map((operation) => operation.command)).toEqual([
+        expect.stringContaining("Running"),
+      ])
+      harness.shell.releaseNext()
+      await settleMicrotasks()
+      expect(dedicatedStatusCommands(harness.commands).at(-1)).toBe(RUNNING_STATUS)
+    },
+    { deferDedicated: true },
+  )
+})
+
+test("finishes at the latest state when a status command is in flight", async () => {
+  await withHarness(
+    async (harness) => {
+      await harness.emit(taskUpdate("root", "latest-message", "latest-task", "running"))
+      await harness.emit(permissionAsked("permission.asked", "root", "latest-permission"))
+      expect(dedicatedStatusCommands(harness.commands)).toEqual([IDLE_STATUS, RUNNING_STATUS])
+      expect(harness.shell.pending).toHaveLength(1)
+
+      harness.shell.releaseNext()
+      await settleMicrotasks()
+      expect(harness.shell.pending.map((operation) => operation.command)).toEqual([
+        expect.stringContaining("Needs input"),
+      ])
+
+      harness.shell.releaseNext()
+      await settleMicrotasks()
+      expect(dedicatedStatusCommands(harness.commands)).toEqual([
+        IDLE_STATUS,
+        RUNNING_STATUS,
+        NEEDS_INPUT_STATUS,
+      ])
+    },
+    { deferDedicated: true },
+  )
 })

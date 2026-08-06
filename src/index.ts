@@ -23,6 +23,10 @@ const plugin: Plugin = async ({ client, $ }) => {
   const permissionAnnouncements = new Map<string, string | undefined>()
 
   const originalSurfaceId = process.env.CMUX_SURFACE_ID
+  const surfaceID = originalSurfaceId?.trim()
+  const indicatorStatusKey = surfaceID
+    ? `opencode-subagents:${surfaceID}`
+    : `opencode-subagents:pid:${process.pid}`
 
   // Read plugin config (once at init)
   let splitsEnabled = false
@@ -136,6 +140,7 @@ const plugin: Plugin = async ({ client, $ }) => {
 
   type IndicatorState = "idle" | "running" | "needs-input"
   type IdleReduction = { record: SessionRecord; generation: number }
+  const IDLE_STABILITY_MS = 250
 
   const activeTaskParts = new Map<string, Map<string, Set<string>>>()
   const sessionRecords = new Map<string, SessionRecord>()
@@ -144,7 +149,12 @@ const plugin: Plugin = async ({ client, $ }) => {
   const childLookups = new Map<string, Promise<void>>()
 
   const MAX_PERMISSION_ANNOUNCEMENTS = 1024
-  let indicatorState: IndicatorState = "idle"
+  let observedState: IndicatorState = "idle"
+  let renderTarget: IndicatorState | undefined
+  let lastAttemptedState: IndicatorState | undefined
+  let idleTimer: ReturnType<typeof setTimeout> | undefined
+  let idleTimerGeneration = 0
+  let renderQueued = false
   const indicatorStatusQueue: Array<() => Promise<void>> = []
   let indicatorStatusBusy = false
 
@@ -193,23 +203,81 @@ const plugin: Plugin = async ({ client, $ }) => {
       })
   }
 
+  function getIndicatorStatus(state: IndicatorState): {
+    text: string
+    icon: string
+    color: string
+  } {
+    return state === "idle"
+      ? { text: "Idle", icon: "pause.circle.fill", color: "#8E8E93" }
+      : state === "running"
+        ? { text: "Running", icon: "bolt.fill", color: "#4C8DFF" }
+        : { text: "Needs input", icon: "bell.fill", color: "#4C8DFF" }
+  }
+
+  function enqueueIndicatorRender(): void {
+    if (renderQueued) return
+    renderQueued = true
+    enqueueIndicatorOperation(async () => {
+      renderQueued = false
+      const target = renderTarget
+      if (target === undefined || target === lastAttemptedState) return
+
+      const status = getIndicatorStatus(target)
+      try {
+        await setStatus($, indicatorStatusKey, status.text, {
+          icon: status.icon,
+          color: status.color,
+        })
+      } finally {
+        lastAttemptedState = target
+        if (renderTarget !== target) enqueueIndicatorRender()
+      }
+    })
+  }
+
+  function invalidateIdleTimer(): void {
+    idleTimerGeneration++
+    if (idleTimer !== undefined) {
+      clearTimeout(idleTimer)
+      idleTimer = undefined
+    }
+  }
+
+  function scheduleIdleRender(): void {
+    if (idleTimer !== undefined) return
+    const generation = ++idleTimerGeneration
+    let timer: ReturnType<typeof setTimeout>
+    timer = setTimeout(() => {
+      if (idleTimer !== timer) return
+      idleTimer = undefined
+      if (generation !== idleTimerGeneration || observedState !== "idle") return
+      renderTarget = "idle"
+      enqueueIndicatorRender()
+    }, IDLE_STABILITY_MS)
+    idleTimer = timer
+  }
+
   function enqueueIndicatorState(state: IndicatorState): void {
-    if (state === indicatorState) return
+    if (state === observedState) {
+      if (state !== "idle" && renderTarget !== state) {
+        renderTarget = state
+        enqueueIndicatorRender()
+      }
+      return
+    }
 
-    indicatorState = state
-    const status =
-      state === "idle"
-        ? { text: "Idle", icon: "pause.circle.fill", color: "#8E8E93" }
-        : state === "running"
-          ? { text: "Running", icon: "bolt.fill", color: "#4C8DFF" }
-          : { text: "Needs input", icon: "bell.fill", color: "#4C8DFF" }
+    observedState = state
+    if (state === "idle") {
+      // Idle is deliberately observed immediately, but is only eligible for
+      // rendering after it has remained current for the stability window.
+      scheduleIdleRender()
+      return
+    }
 
-    enqueueIndicatorOperation(() =>
-      setStatus($, "opencode-subagents", status.text, {
-        icon: status.icon,
-        color: status.color,
-      }),
-    )
+    invalidateIdleTimer()
+    renderTarget = state
+    enqueueIndicatorRender()
   }
 
   function updateIndicatorState(): void {
@@ -224,12 +292,8 @@ const plugin: Plugin = async ({ client, $ }) => {
   // Migrate the old generic indicator before publishing the persistent
   // dedicated indicator. Both operations share the same non-poisoning FIFO.
   enqueueIndicatorOperation(() => clearStatus($, "opencode"))
-  enqueueIndicatorOperation(() =>
-    setStatus($, "opencode-subagents", "Idle", {
-      icon: "pause.circle.fill",
-      color: "#8E8E93",
-    }),
-  )
+  enqueueIndicatorOperation(() => clearStatus($, "opencode-subagents"))
+  scheduleIdleRender()
 
   function getID(value: unknown): string | undefined {
     if (typeof value !== "string") return undefined

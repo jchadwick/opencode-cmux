@@ -120,6 +120,291 @@ const plugin: Plugin = async ({ client, $ }) => {
 
   const activeSplits = new Map<string, string>()
 
+  type SessionActivityStatus = "busy" | "retry" | "idle"
+  type SessionRecord = {
+    known: boolean
+    isChild: boolean
+    parentID?: string
+    title?: string
+    active: boolean
+    latestStatus?: SessionActivityStatus
+    deleted: boolean
+    errored: boolean
+    idleHandled: boolean
+  }
+
+  // These are intentionally private to this plugin instance. A task part can
+  // outlive a session status event, so session activity and task-part activity
+  // are reduced independently and then combined into one boolean.
+  const activeTaskParts = new Map<string, Map<string, Set<string>>>()
+  const sessionRecords = new Map<string, SessionRecord>()
+  const sessionLookups = new Map<string, Promise<{ title: string; parentID?: string } | null>>()
+  const childLookups = new Map<string, Promise<void>>()
+
+  let subagentsVisible = false
+  let subagentStatusQueue = Promise.resolve()
+
+  function hasActiveTaskParts(): boolean {
+    for (const messages of activeTaskParts.values()) {
+      for (const partIDs of messages.values()) {
+        if (partIDs.size > 0) return true
+      }
+    }
+    return false
+  }
+
+  function hasActiveChildSessions(): boolean {
+    for (const session of sessionRecords.values()) {
+      if (session.isChild && session.active && !session.deleted && !session.errored) {
+        return true
+      }
+    }
+    return false
+  }
+
+  function enqueueSubagentStatus(visible: boolean): void {
+    const operation = () =>
+      visible
+        ? setStatus($, "opencode-subagents", "agent working", {
+            icon: "terminal",
+            color: "#f59e0b",
+          })
+        : clearStatus($, "opencode-subagents")
+
+    // Recover the tail after every operation. The renderer is best effort and
+    // must not prevent a later transition from being sent.
+    subagentStatusQueue = subagentStatusQueue.then(operation, operation).catch(() => {})
+  }
+
+  function updateSubagentVisibility(): void {
+    const visible = hasActiveTaskParts() || hasActiveChildSessions()
+    if (visible === subagentsVisible) return
+
+    // Set the desired state synchronously, before the renderer can be awaited.
+    subagentsVisible = visible
+    enqueueSubagentStatus(visible)
+  }
+
+  function getID(value: unknown): string | undefined {
+    return typeof value === "string" && value.length > 0 && value.trim().length > 0
+      ? value
+      : undefined
+  }
+
+  function getSessionRecord(sessionID: string): SessionRecord {
+    const existing = sessionRecords.get(sessionID)
+    if (existing) return existing
+
+    const record: SessionRecord = {
+      known: false,
+      isChild: false,
+      active: false,
+      deleted: false,
+      errored: false,
+      idleHandled: false,
+    }
+    sessionRecords.set(sessionID, record)
+    return record
+  }
+
+  function isActiveSessionStatus(
+    status: SessionActivityStatus | undefined,
+  ): status is "busy" | "retry" {
+    return status === "busy" || status === "retry"
+  }
+
+  function reduceSessionCreated(info: any): void {
+    const sessionID = getID(info?.id)
+    if (!sessionID) return
+
+    const parentID = getID(info?.parentID)
+    const record = getSessionRecord(sessionID)
+    record.known = true
+    record.isChild = parentID !== undefined
+    record.parentID = parentID
+    if (typeof info?.title === "string") record.title = info.title
+    record.deleted = false
+    record.errored = false
+    record.idleHandled = false
+
+    // Creation records the relationship only. It must not itself make a
+    // child appear active. Preserve activity if a status was already observed.
+    if (!record.isChild) record.active = false
+    updateSubagentVisibility()
+  }
+
+  function reduceTaskPartUpdated(part: any): void {
+    if (part?.type !== "tool" || part.tool !== "task") return
+
+    const sessionID = getID(part.sessionID)
+    const messageID = getID(part.messageID)
+    const partID = getID(part.id)
+    if (!sessionID || !messageID || !partID) return
+
+    const session = sessionRecords.get(sessionID)
+    if (session?.deleted || session?.errored) return
+
+    const status = part.state?.status
+    if (status === "running") {
+      let messages = activeTaskParts.get(sessionID)
+      if (!messages) {
+        messages = new Map()
+        activeTaskParts.set(sessionID, messages)
+      }
+
+      let partIDs = messages.get(messageID)
+      if (!partIDs) {
+        partIDs = new Set()
+        messages.set(messageID, partIDs)
+      }
+
+      if (!partIDs.has(partID)) {
+        partIDs.add(partID)
+        updateSubagentVisibility()
+      }
+      return
+    }
+
+    if (status !== "completed" && status !== "error") return
+
+    const messages = activeTaskParts.get(sessionID)
+    const partIDs = messages?.get(messageID)
+    if (!partIDs?.delete(partID)) return
+
+    if (partIDs.size === 0) messages?.delete(messageID)
+    if (messages?.size === 0) activeTaskParts.delete(sessionID)
+    updateSubagentVisibility()
+  }
+
+  function reduceTaskPartRemoved(properties: any): void {
+    const sessionID = getID(properties?.sessionID)
+    const messageID = getID(properties?.messageID)
+    const partID = getID(properties?.partID)
+    if (!sessionID || !messageID || !partID) return
+
+    const messages = activeTaskParts.get(sessionID)
+    const partIDs = messages?.get(messageID)
+    if (!partIDs?.delete(partID)) return
+
+    if (partIDs.size === 0) messages?.delete(messageID)
+    if (messages?.size === 0) activeTaskParts.delete(sessionID)
+    updateSubagentVisibility()
+  }
+
+  function reduceMessageRemoved(properties: any): void {
+    const sessionID = getID(properties?.sessionID)
+    const messageID = getID(properties?.messageID)
+    if (!sessionID || !messageID) return
+
+    const messages = activeTaskParts.get(sessionID)
+    if (!messages?.delete(messageID)) return
+    if (messages.size === 0) activeTaskParts.delete(sessionID)
+    updateSubagentVisibility()
+  }
+
+  function reduceSessionActivityCleanup(sessionID: string, deleted: boolean): void {
+    const record = getSessionRecord(sessionID)
+    record.active = false
+    record.latestStatus = undefined
+    record.errored = true
+    record.deleted = deleted
+    record.idleHandled = false
+    activeTaskParts.delete(sessionID)
+    updateSubagentVisibility()
+    if (deleted) evictDeletedSessionRecord(sessionID, record)
+  }
+
+  function reduceSessionStatus(
+    sessionID: string | undefined,
+    status: unknown,
+  ): Promise<void> | boolean | undefined {
+    if (!sessionID) return undefined
+    const record = getSessionRecord(sessionID)
+    if (record.deleted) return status === "idle" ? false : undefined
+
+    if (status === "busy" || status === "retry") {
+      record.latestStatus = status
+      record.errored = false
+      record.idleHandled = false
+
+      if (record.known) {
+        if (record.isChild && !record.active) {
+          record.active = true
+          updateSubagentVisibility()
+        }
+        return undefined
+      }
+
+      return ensureChildLookup(sessionID)
+    }
+
+    if (status === "idle") {
+      record.latestStatus = "idle"
+      record.errored = false
+      if (record.isChild) {
+        record.active = false
+        updateSubagentVisibility()
+      }
+
+      if (record.idleHandled) return false
+      record.idleHandled = true
+      return true
+    }
+
+    return undefined
+  }
+
+  function reduceSessionDeletedOrErrored(
+    sessionID: string | undefined,
+    deleted: boolean,
+  ): void {
+    if (!sessionID) return
+    reduceSessionActivityCleanup(sessionID, deleted)
+  }
+
+  function cacheSessionDetails(
+    sessionID: string,
+    details: { title: string; parentID?: string },
+  ): SessionRecord {
+    const record = getSessionRecord(sessionID)
+    if (typeof details.title === "string") record.title = details.title
+
+    // An explicit session.created relationship is authoritative. Otherwise,
+    // cache the relationship returned by session.get for later idle handling.
+    if (!record.known) {
+      record.known = true
+      record.parentID = getID(details.parentID)
+      record.isChild = record.parentID !== undefined
+    }
+    return record
+  }
+
+  function getCachedSessionDetails(
+    sessionID: string,
+  ): { title: string; parentID?: string } | null {
+    const record = sessionRecords.get(sessionID)
+    if (!record?.known) return null
+    return {
+      title: record.title ?? sessionID,
+      parentID: record.isChild ? record.parentID : undefined,
+    }
+  }
+
+  function evictDeletedSessionRecord(
+    sessionID: string,
+    record: SessionRecord,
+  ): void {
+    if (
+      sessionRecords.get(sessionID) !== record ||
+      !record.deleted ||
+      sessionLookups.has(sessionID) ||
+      childLookups.has(sessionID)
+    ) {
+      return
+    }
+    sessionRecords.delete(sessionID)
+  }
+
   // Rightmost surface in each of the 3 rows (top-right, bottom-right, bottom-left)
   // Used as split targets when adding new columns
   const rowFrontier: (string | undefined)[] = [undefined, undefined, undefined]
@@ -186,12 +471,121 @@ const plugin: Plugin = async ({ client, $ }) => {
     }
   }
 
+  function fetchSessionOnce(
+    sessionID: string,
+  ): Promise<{ title: string; parentID?: string } | null> {
+    const existing = sessionLookups.get(sessionID)
+    if (existing) return existing
+
+    const lookup = fetchSession(sessionID)
+    const record = sessionRecords.get(sessionID)
+    sessionLookups.set(sessionID, lookup)
+    void lookup.then(
+      () => {
+        if (sessionLookups.get(sessionID) === lookup) sessionLookups.delete(sessionID)
+        if (record) evictDeletedSessionRecord(sessionID, record)
+      },
+      () => {
+        if (sessionLookups.get(sessionID) === lookup) sessionLookups.delete(sessionID)
+        if (record) evictDeletedSessionRecord(sessionID, record)
+      },
+    )
+    return lookup
+  }
+
+  function ensureChildLookup(sessionID: string): Promise<void> {
+    const existing = childLookups.get(sessionID)
+    if (existing) return existing
+
+    const lookupRecord = sessionRecords.get(sessionID)
+    const lookup = (async () => {
+      const details = await fetchSessionOnce(sessionID)
+      if (!details) return
+
+      const record = sessionRecords.get(sessionID)
+      if (!record || record.deleted || record.errored) return
+      const wasKnown = record.known
+      const returnedParentID = getID(details.parentID)
+      cacheSessionDetails(sessionID, details)
+
+      // A lookup may finish after idle, error, or deletion. Only the current
+      // busy/retry state can activate a child, and a deleted session is never
+      // resurrected by a stale response.
+      if (
+        !isActiveSessionStatus(record.latestStatus) ||
+        returnedParentID === undefined
+      ) {
+        return
+      }
+
+      // A session.created event that identified this as a root wins over an
+      // out-of-date lookup result.
+      if (wasKnown && !record.isChild) return
+
+      record.known = true
+      record.isChild = true
+      record.parentID = returnedParentID
+      if (!record.active) {
+        record.active = true
+        updateSubagentVisibility()
+      }
+    })()
+
+    childLookups.set(sessionID, lookup)
+    void lookup.then(
+      () => {
+        if (childLookups.get(sessionID) === lookup) childLookups.delete(sessionID)
+        if (lookupRecord) evictDeletedSessionRecord(sessionID, lookupRecord)
+      },
+      () => {
+        if (childLookups.get(sessionID) === lookup) childLookups.delete(sessionID)
+        if (lookupRecord) evictDeletedSessionRecord(sessionID, lookupRecord)
+      },
+    )
+    return lookup
+  }
+
+  async function handleSessionIdle(
+    sessionID: string,
+    waitingAtEvent: boolean,
+  ): Promise<void> {
+    if (waitingAtEvent) return
+
+    let session = getCachedSessionDetails(sessionID)
+    if (!session) {
+      session = await fetchSessionOnce(sessionID)
+      const record = sessionRecords.get(sessionID)
+      if (!record || record.deleted || record.errored) return
+      if (session) cacheSessionDetails(sessionID, session)
+    }
+
+    const record = sessionRecords.get(sessionID)
+    if (!record || record.deleted || record.errored) return
+    const title = session?.title ?? record?.title ?? sessionID
+    const isChild = record?.known ? record.isChild : session?.parentID !== undefined
+
+    // Preserve the existing child completion log and split cleanup.
+    if (isChild) {
+      await log($, `Subagent finished: ${title}`, {
+        level: "info",
+        source: "opencode",
+      })
+      removeAndClose(sessionID)
+      return
+    }
+
+    if (notifyOn.done) await notify($, { title: `Done: ${title}` })
+    await log($, `Done: ${title}`, { level: "success", source: "opencode" })
+    await clearStatus($, "opencode")
+  }
+
   return {
     async event({ event }) {
       const e = event as any
 
       if (e.type === "session.created") {
         const info = e.properties.info
+        reduceSessionCreated(info)
         if (splitsEnabled && info?.parentID) {
           const url = resolveServerUrl()
           if (url) {
@@ -245,54 +639,76 @@ const plugin: Plugin = async ({ client, $ }) => {
 
       if (e.type === "session.deleted") {
         const info = e.properties.info
-        if (info?.id) removeAndClose(info.id)
+        const sessionID = getID(info?.id)
+        reduceSessionDeletedOrErrored(sessionID, true)
+        if (sessionID) removeAndClose(sessionID)
+        return
+      }
+
+      if (e.type === "message.part.updated") {
+        reduceTaskPartUpdated(e.properties?.part)
+        return
+      }
+
+      if (e.type === "message.part.removed") {
+        reduceTaskPartRemoved(e.properties)
+        return
+      }
+
+      if (e.type === "message.removed") {
+        reduceMessageRemoved(e.properties)
         return
       }
 
       if (e.type === "session.status") {
-        const { sessionID, status } = e.properties
+        const { sessionID, status } = e.properties ?? {}
+        const childLookup = reduceSessionStatus(sessionID, status?.type)
 
-        if (status.type === "busy") {
+        if (status?.type === "busy") {
           if (!isWaitingForInput()) {
             await setStatus($, "opencode", "working", {
               icon: "terminal",
               color: "#f59e0b",
             })
           }
+          if (childLookup && typeof childLookup !== "boolean") await childLookup
           return
         }
 
-        if (status.type === "idle") {
-          if (isWaitingForInput()) {
-            return
-          }
+        if (status?.type === "retry") {
+          if (childLookup && typeof childLookup !== "boolean") await childLookup
+          return
+        }
 
-          const session = await fetchSession(sessionID)
-          const title = session?.title ?? sessionID
-
-          if (!session?.parentID) {
-            if (notifyOn.done) await notify($, { title: `Done: ${title}` })
-            await log($, `Done: ${title}`, { level: "success", source: "opencode" })
-            await clearStatus($, "opencode")
-          } else {
-            await log($, `Subagent finished: ${title}`, {
-              level: "info",
-              source: "opencode",
-            })
-
-            removeAndClose(sessionID)
+        if (status?.type === "idle") {
+          if (sessionID && childLookup !== false) {
+            await handleSessionIdle(sessionID, isWaitingForInput())
           }
           return
         }
       }
 
+      if (e.type === "session.idle") {
+        const sessionID = getID(e.properties?.sessionID)
+        const childLookup = reduceSessionStatus(sessionID, "idle")
+        if (childLookup && typeof childLookup !== "boolean") await childLookup
+        if (sessionID && childLookup !== false) {
+          await handleSessionIdle(sessionID, isWaitingForInput())
+        }
+        return
+      }
+
       if (e.type === "session.error") {
+        const sessionID = getID(e.properties?.sessionID)
+        reduceSessionDeletedOrErrored(sessionID, false)
+
         pendingPermissions.clear()
         pendingQuestions.clear()
 
-        const sessionID = e.properties.sessionID
         const title = sessionID
-          ? (await fetchSession(sessionID))?.title ?? sessionID
+          ? (getCachedSessionDetails(sessionID)?.title ??
+            (await fetchSessionOnce(sessionID))?.title ??
+            sessionID)
           : "unknown session"
 
         if (notifyOn.error) await notify($, { title: `Error: ${title}` })

@@ -69,12 +69,18 @@ Without `--port`, splits are silently skipped even when enabled.
 
 | Event | cmux action |
 |---|---|
-| Session starts working | Sidebar status: "working" (amber, terminal icon) |
-| Session completes (primary) | Desktop notification + log + clear status |
+| Any session starts working | Sidebar status: "working" (amber, terminal icon) |
+| A task tool is running, or a child is busy/retrying | Sidebar status: "agent working" under `opencode-subagents` |
+| No task tools are running and no child is busy/retrying | Clear the `opencode-subagents` status |
+| Session completes (primary) | Desktop notification + log + clear generic status |
 | Session completes (subagent) | Log only (no notification spam) |
-| Session error | Desktop notification + log + clear status |
+| Session error | Desktop notification + log + clear generic status |
 | Permission requested | Desktop notification + sidebar status: "waiting" (red, lock icon) |
 | AI has a question (`ask` tool) | Desktop notification + sidebar status: "question" (purple) |
+
+The dedicated `opencode-subagents` status ignores pending task tools and is
+cleared only after both task tools and child sessions are inactive. It is
+independent of the generic `opencode` status.
 
 ## How it works
 

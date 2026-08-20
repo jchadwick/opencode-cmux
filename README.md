@@ -69,12 +69,17 @@ Without `--port`, splits are silently skipped even when enabled.
 
 | Event | cmux action |
 |---|---|
-| Session starts working | Sidebar status: "working" (amber, terminal icon) |
-| Session completes (primary) | Desktop notification + log + clear status |
+| Any session is busy/retrying, or a `task` tool is running | Sidebar status: "Running" (blue, bolt icon) |
+| Permission or question is pending | Sidebar status: "Needs input" (blue, bell icon) |
+| No activity or input remains | Sidebar status: "Idle" (gray, pause icon) after 250 ms |
+| Session completes (primary) | Desktop notification + log |
 | Session completes (subagent) | Log only (no notification spam) |
-| Session error | Desktop notification + log + clear status |
-| Permission requested | Desktop notification + sidebar status: "waiting" (red, lock icon) |
-| AI has a question (`ask` tool) | Desktop notification + sidebar status: "question" (purple) |
+| Session error | Desktop notification + log |
+| Permission requested | Desktop notification + log |
+| AI has a question (`ask` tool) | Desktop notification + log |
+
+The sidebar key is `opencode-subagents:$CMUX_SURFACE_ID` (trimmed), falling
+back to `opencode-subagents:pid:$PID` when no surface ID is available.
 
 ## How it works
 
